@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+[[ $EUID -eq 0 ]] || {
+    printf 'acceptance must run as disposable container root\n' >&2
+    exit 2
+}
+[[ -f /etc/arch-release ]] || {
+    printf 'acceptance requires Arch Linux\n' >&2
+    exit 2
+}
+[[ -f /.dockerenv || -f /run/doubt-disposable-acceptance ]] || {
+    printf 'acceptance refuses the live workstation\n' >&2
+    exit 2
+}
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/doubt-acceptance.XXXXXXXX")
+SERVER_PID=''
+cleanup() {
+    local status=$?
+    if [[ $status -ne 0 && -d "$WORK" ]]; then
+        printf 'acceptance failed with status %s\n' "$status" >&2
+        for output in "$WORK"/*.out "$WORK"/*.out.clean "$WORK/server.log" "$WORK/provider-state"/*; do
+            [[ -f "$output" ]] || continue
+            printf 'acceptance log: %s\n' "${output##*/}" >&2
+            tail -80 "$output" >&2 || true
+        done
+    fi
+    [[ -z "$SERVER_PID" ]] || kill "$SERVER_PID" 2>/dev/null || true
+    case "$WORK" in
+        /tmp/doubt-acceptance.*)
+            [[ -d "$WORK" && ! -L "$WORK" ]] && rm -rf -- "$WORK"
+            ;;
+    esac
+    return "$status"
+}
+trap cleanup EXIT HUP INT TERM
+trap 'printf "acceptance assertion failed at line %s\n" "$LINENO" >&2' ERR
+
+ASSETS="$WORK/assets"
+SERVE="$WORK/serve"
+FIXTURES="$WORK/fixtures"
+STATE="$WORK/provider-state"
+mkdir -m 0700 -- "$ASSETS" "$SERVE" "$FIXTURES" "$STATE"
+touch "$STATE/pacman" "$STATE/aur" "$STATE/flatpak" "$STATE/mutations"
+
+release/build "$ASSETS"
+cp -- "$ROOT/bootstrap/install" "$SERVE/install"
+cp -- "$ASSETS/doubt-1.0.5-x86_64.tar.gz" "$SERVE/"
+cp -- "$ASSETS/release-members.txt" "$SERVE/"
+
+readonly PORT=18743
+python -m http.server "$PORT" --bind 127.0.0.1 --directory "$SERVE" \
+    >"$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+for _attempt in {1..20}; do
+    /usr/bin/curl -fsS "http://127.0.0.1:$PORT/install" >/dev/null 2>&1 && break
+    sleep 0.25
+done
+/usr/bin/curl -fsS "http://127.0.0.1:$PORT/install" >/dev/null
+
+for command in pacman yay flatpak sudo curl git gh ssh ssh-keygen vercmp; do
+    cp -- "$ROOT/acceptance/fixtures/tool" "$FIXTURES/$command"
+done
+chmod 0755 "$FIXTURES"
+chmod 0755 "$FIXTURES"/*
+cp -- "$ROOT/acceptance/fixtures/tool" /usr/bin/codex
+chmod 0755 /usr/bin/codex
+
+touch /run/doubt-disposable-acceptance
+chown root:root /run/doubt-disposable-acceptance
+chmod 0600 /run/doubt-disposable-acceptance
+
+useradd --create-home --home-dir "$WORK/home" --shell /bin/bash doubtaccept
+chgrp doubtaccept "$WORK"
+chmod 0710 "$WORK"
+chmod 0700 "$WORK/home"
+chown -R doubtaccept:doubtaccept "$WORK/home" "$STATE"
+printf 'doubtaccept ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/doubt-acceptance
+chmod 0440 /etc/sudoers.d/doubt-acceptance
+
+/usr/bin/pacman -Rdd --noconfirm python python-pip
+! command -v python >/dev/null
+! command -v python3 >/dev/null
+
+before_packages=$(/usr/bin/pacman -Qq | sort | sha256sum | cut -d ' ' -f 1)
+before_repository=$(
+    find "$ROOT" -path "$ROOT/.git" -prune -o -type f -print0 \
+        | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1
+)
+
+run_installer() {
+    local home=$1 answer=$2 output=$3 temporary=$4 provider_state=${5:-$STATE}
+    local installer_command=${6:-}
+    local -a invocation=(
+        script -qefc "curl -fsSL http://127.0.0.1:$PORT/install | bash" /dev/null
+    )
+    if [[ -n "$installer_command" ]]; then
+        invocation=(script -qefc "$installer_command" /dev/null)
+    fi
+    local input="$temporary/terminal-input" done_file="$temporary/terminal-done" writer status=0
+    mkdir -m 0700 -- "$temporary"
+    chown doubtaccept:doubtaccept "$temporary"
+    mkfifo -- "$input"
+    chown doubtaccept:doubtaccept "$input"
+    (
+        exec 4>"$input"
+        printf '%s\n' "$answer" >&4
+        while [[ ! -f "$done_file" ]]; do sleep 0.1; done
+    ) &
+    writer=$!
+    (
+        cd "$home"
+        runuser -u doubtaccept -- env \
+            HOME="$home" \
+            USER=doubtaccept \
+            PATH="$home/.local/bin:$FIXTURES:/usr/bin" \
+            TMPDIR="$temporary" \
+            DOUBT_ACCEPTANCE_STATE="$provider_state" \
+            DOUBT_ACCEPTANCE_BASE_URL="http://127.0.0.1:$PORT" \
+            DOUBT_GIT_NAME='Doubt Acceptance' \
+            DOUBT_GIT_EMAIL='doubt-acceptance@example.invalid' \
+            "${invocation[@]}"
+    ) <"$input" >"$output" || status=$?
+    touch "$done_file"
+    wait "$writer"
+    rm -f -- "$input" "$done_file"
+    (( status == 0 )) || return "$status"
+    tr -d '\r' <"$output" >"$output.clean"
+}
+
+DECLINE_HOME="$WORK/decline-home"
+DECLINE_TMP="$WORK/decline-tmp"
+mkdir -m 0700 -- "$DECLINE_HOME"
+chown doubtaccept:doubtaccept "$DECLINE_HOME"
+run_installer "$DECLINE_HOME" n "$WORK/decline.out" "$DECLINE_TMP"
+grep -F 'Declined. No changes were made.' "$WORK/decline.out.clean" >/dev/null
+[[ $(grep -Fc 'Continue? [y/N]' "$WORK/decline.out.clean") -eq 1 ]]
+[[ -z $(find "$DECLINE_HOME" -mindepth 1 -print -quit) ]]
+[[ -z $(find "$DECLINE_TMP" -mindepth 1 -print -quit) ]]
+[[ ! -s "$STATE/mutations" ]]
+
+FIRST_TMP="$WORK/first-tmp"
+run_installer "$WORK/home" y "$WORK/first.out" "$FIRST_TMP"
+grep -Fx 'Doubt 1.0.5' "$WORK/first.out.clean" >/dev/null
+for expected in \
+    'Checking workstation...' \
+    'Dependencies' \
+    'Applications' \
+    'GitHub and SSH' \
+    'Codex profiles' \
+    'PATH integration' \
+    'Installing dependencies' \
+    'Installing applications' \
+    'Configuring GitHub' \
+    'Configuring SSH' \
+    'Configuring Git' \
+    'Configuring Codex 01' \
+    'Configuring Codex 02' \
+    'Configuring launcher PATH' \
+    'Verifying workstation' \
+    'Complete' \
+    'Workstation ready.' \
+    'Failed         0'; do
+    grep -F "$expected" "$WORK/first.out.clean" >/dev/null
+done
+! grep -E '^  (Dependencies|Applications|done|Installed|Configured|Unchanged|Failed)' \
+    "$WORK/first.out.clean" >/dev/null
+for hidden in \
+    'Looking for matches?' \
+    'acceptance.Application permissions:' \
+    'ID Branch Op Remote Download' \
+    'Installation complete.'; do
+    ! grep -F "$hidden" "$WORK/first.out.clean" >/dev/null
+done
+[[ $(grep -Fc 'Continue? [y/N]' "$WORK/first.out.clean") -eq 1 ]]
+[[ -x "$WORK/home/.local/bin/doubt" ]]
+[[ -x "$WORK/home/.local/share/doubt/current/doubt" ]]
+[[ -f "$WORK/home/.local/share/doubt/current/.doubt-release" ]]
+grep -Fx 'version=1.0.5' "$WORK/home/.local/share/doubt/current/.doubt-release" >/dev/null
+for launcher in codex-01 codex-02; do
+    [[ -x "$WORK/home/.local/bin/$launcher" ]]
+done
+[[ ! -e "$WORK/home/.local/bin/codex-personal" ]]
+[[ ! -e "$WORK/home/.local/bin/codex-work" ]]
+grep -F 'CODEX_HOME="$HOME/.codex-01"' "$WORK/home/.local/bin/codex-01" >/dev/null
+grep -F 'CODEX_HOME="$HOME/.codex-02"' "$WORK/home/.local/bin/codex-02" >/dev/null
+[[ -f "$WORK/home/.config/fish/conf.d/doubt-path.fish" ]]
+grep -F '$HOME/.local/bin' "$WORK/home/.config/fish/conf.d/doubt-path.fish" >/dev/null
+[[ -d "$WORK/home/.config/doubt/packages" ]]
+[[ -z $(find "$FIRST_TMP" -mindepth 1 -print -quit) ]]
+[[ ! -e "$WORK/home/.cache" ]]
+
+VERBOSE_HOME="$WORK/verbose-home"
+VERBOSE_TMP="$WORK/verbose-tmp"
+VERBOSE_STATE="$WORK/verbose-provider-state"
+mkdir -m 0700 -- "$VERBOSE_HOME" "$VERBOSE_STATE"
+touch "$VERBOSE_STATE/pacman" "$VERBOSE_STATE/aur" "$VERBOSE_STATE/flatpak" \
+    "$VERBOSE_STATE/mutations"
+chown -R doubtaccept:doubtaccept "$VERBOSE_HOME" "$VERBOSE_STATE"
+run_installer "$VERBOSE_HOME" y "$WORK/verbose.out" "$VERBOSE_TMP" "$VERBOSE_STATE" \
+    "curl -fsSL http://127.0.0.1:$PORT/install | bash -s -- --verbose"
+for visible in \
+    'run: flatpak install' \
+    'Looking for matches?' \
+    'acceptance.Application permissions:' \
+    'ID Branch Op Remote Download' \
+    'Installation complete.'; do
+    grep -F "$visible" "$WORK/verbose.out.clean" >/dev/null
+done
+[[ -z $(find "$VERBOSE_TMP" -mindepth 1 -print -quit) ]]
+
+[[ $(sort -u "$STATE/pacman" | wc -l) -eq 12 ]]
+[[ $(sort -u "$STATE/aur" | wc -l) -eq 2 ]]
+[[ $(sort -u "$STATE/flatpak" | wc -l) -eq 5 ]]
+for package in git base-devel flatpak openai-codex nodejs ripgrep github-cli openssh \
+    torbrowser-launcher mullvad-vpn; do
+    grep -Fx "$package" "$STATE/pacman" >/dev/null
+done
+
+printf '# preserved acceptance declaration\n' \
+    >>"$WORK/home/.config/doubt/packages/apps/pacman/browser"
+mv -- "$WORK/home/.codex-01" "$WORK/home/.codex-personal"
+mv -- "$WORK/home/.codex-02" "$WORK/home/.codex-work"
+mv -- "$WORK/home/.local/bin/codex-01" "$WORK/home/.local/bin/codex-personal"
+sed -i 's/codex-01: HOME/codex-personal: HOME/' "$WORK/home/.local/bin/codex-personal"
+sed -i 's/\.codex-01/\.codex-personal/' "$WORK/home/.local/bin/codex-personal"
+mv -- "$WORK/home/.local/bin/codex-02" "$WORK/home/.local/bin/codex-work"
+sed -i 's/codex-02: HOME/codex-work: HOME/' "$WORK/home/.local/bin/codex-work"
+sed -i 's/\.codex-02/\.codex-work/' "$WORK/home/.local/bin/codex-work"
+auth_before=$(sha256sum \
+    "$WORK/home/.codex-personal/auth.json" \
+    "$WORK/home/.codex-work/auth.json" | cut -d ' ' -f 1 | sha256sum)
+mutations_before=$(wc -l <"$STATE/mutations")
+SECOND_TMP="$WORK/second-tmp"
+run_installer "$WORK/home" y "$WORK/second.out" "$SECOND_TMP"
+grep -F 'Complete' "$WORK/second.out.clean" >/dev/null
+[[ $(grep -Fc 'Continue? [y/N]' "$WORK/second.out.clean") -eq 1 ]]
+for launcher in codex-01 codex-02; do
+    [[ -x "$WORK/home/.local/bin/$launcher" ]]
+done
+[[ ! -e "$WORK/home/.local/bin/codex-personal" ]]
+[[ ! -e "$WORK/home/.local/bin/codex-work" ]]
+auth_after=$(sha256sum \
+    "$WORK/home/.codex-01/auth.json" \
+    "$WORK/home/.codex-02/auth.json" | cut -d ' ' -f 1 | sha256sum)
+[[ "$auth_before" == "$auth_after" ]]
+[[ ! -e "$WORK/home/.codex-personal" && ! -e "$WORK/home/.codex-work" ]]
+grep -Fx '# preserved acceptance declaration' \
+    "$WORK/home/.config/doubt/packages/apps/pacman/browser" >/dev/null
+[[ $(wc -l <"$STATE/mutations") -eq "$mutations_before" ]]
+[[ -z $(find "$SECOND_TMP" -mindepth 1 -print -quit) ]]
+
+THIRD_TMP="$WORK/third-tmp"
+run_installer "$WORK/home" y "$WORK/third.out" "$THIRD_TMP"
+grep -F 'No changes required.' "$WORK/third.out.clean" >/dev/null
+grep -F 'Verification passed.' "$WORK/third.out.clean" >/dev/null
+! grep -F 'Continue? [y/N]' "$WORK/third.out.clean" >/dev/null
+[[ $(wc -l <"$STATE/mutations") -eq "$mutations_before" ]]
+[[ -z $(find "$THIRD_TMP" -mindepth 1 -print -quit) ]]
+
+after_packages=$(/usr/bin/pacman -Qq | sort | sha256sum | cut -d ' ' -f 1)
+after_repository=$(
+    find "$ROOT" -path "$ROOT/.git" -prune -o -type f -print0 \
+        | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1
+)
+[[ "$before_packages" == "$after_packages" ]]
+[[ "$before_repository" == "$after_repository" ]]
+! find "$WORK/home" -path '*/.cache/doubt*' -print -quit | grep .
+! find "$WORK/home" -iname '*yay*' -o -iname '*makepkg*' | grep .
+
+printf 'candidate one-command acceptance passed\n'
+printf 'python prerequisite: absent\n'
+printf 'first confirmation count: 1\n'
+printf 'launcher-upgrade confirmation count: 1\n'
+printf 'idempotent confirmation count: 0\n'
+printf 'provider mutations first run: %s\n' "$mutations_before"
+printf 'provider mutations launcher upgrade: 0\n'
+printf 'provider mutations idempotent run: 0\n'
+printf 'Codex profile authentication: preserved\n'
+printf 'verbose provider output: streamed\n'
+printf 'temporary residue: none\n'
+printf 'host package fingerprint: %s\n' "$after_packages"

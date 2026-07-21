@@ -1,0 +1,1 @@
+"""Quick-installer bootstrap tests."""

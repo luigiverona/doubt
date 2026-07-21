@@ -1,0 +1,117 @@
+name: Pages
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Annotated release tag to verify and deploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  PAGE_TAG: ${{ inputs.tag }}
+
+jobs:
+  build:
+    name: Verify release and build deterministic Pages artifact
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel-20260712.0.555161@sha256:212b1e518e94ee9c52be55e8a32da75fcf11e7b5610b80b49479e67880102406
+    steps:
+      - name: Bootstrap pinned Arch release environment
+        run: |
+          printf 'Server = https://archive.archlinux.org/repos/2026/07/12/$repo/os/$arch\n' \
+            >/etc/pacman.d/mirrorlist
+          pacman -Sy --noconfirm --needed git python python-pip github-cli curl
+      - name: Check out annotated release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+      - name: Verify immutable Pages source
+        run: |
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" cat-file -t "refs/tags/$PAGE_TAG")" = tag
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" for-each-ref \
+            --format='%(contents:subject)' "refs/tags/$PAGE_TAG")" = "doubt $PAGE_TAG"
+          release_commit=$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse "refs/tags/$PAGE_TAG^{}")
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$release_commit"
+          python3 -m quality.version --tag "$PAGE_TAG"
+          git -c safe.directory="$GITHUB_WORKSPACE" fetch --no-tags origin \
+            +refs/heads/main:refs/remotes/origin/main
+          git -c safe.directory="$GITHUB_WORKSPACE" merge-base --is-ancestor \
+            "$release_commit" origin/main
+      - name: Install pinned release build tools
+        run: |
+          python -m venv /tmp/doubt-pages
+          /tmp/doubt-pages/bin/pip install --disable-pip-version-check \
+            --require-hashes -r requirements/build.txt
+          echo /tmp/doubt-pages/bin >> "$GITHUB_PATH"
+      - name: Rebuild and verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          expected="$RUNNER_TEMP/expected-release"
+          public="$RUNNER_TEMP/public-release"
+          release/build "$expected"
+          mkdir -m 0700 "$public"
+          mapfile -t expected_names < <(
+            find "$expected" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+          )
+          mapfile -t remote_names < <(
+            gh release view "$PAGE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,isPrerelease,assets \
+              --jq 'select(.isDraft == false and .isPrerelease == false) | .assets[].name' | sort
+          )
+          test "${expected_names[*]}" = "${remote_names[*]}"
+          for name in "${expected_names[@]}"; do
+            url=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PAGE_TAG" \
+              --jq ".assets[] | select(.name == \"$name\") | .browser_download_url")
+            curl --fail --silent --show-error --location \
+              --proto '=https' --proto-redir '=https' --tlsv1.2 \
+              --retry 4 --retry-all-errors --retry-delay 2 \
+              --output "$public/$name" "$url"
+            cmp -- "$expected/$name" "$public/$name"
+          done
+          (cd "$public" && sha256sum --check --strict SHA256SUMS)
+      - name: Configure Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Build and verify site
+        run: python3 -m distribution.site "$RUNNER_TEMP/site"
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: ${{ runner.temp }}/site
+
+  deploy:
+    name: Deploy verified release to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

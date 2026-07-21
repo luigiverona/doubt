@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+[[ $# -eq 1 ]] || {
+    printf 'usage: release/build OUTPUT_DIRECTORY\n' >&2
+    exit 2
+}
+OUTPUT=$1
+[[ "$OUTPUT" == /* ]] || {
+    printf 'release output directory must be absolute\n' >&2
+    exit 2
+}
+mkdir -p -- "$OUTPUT"
+[[ -d "$OUTPUT" && ! -L "$OUTPUT" ]] || {
+    printf 'release output path must be a real directory\n' >&2
+    exit 2
+}
+[[ -z "$(find "$OUTPUT" -mindepth 1 -maxdepth 1 -print -quit)" ]] || {
+    printf 'release output directory must be empty\n' >&2
+    exit 2
+}
+
+cd "$ROOT"
+ARCHIVE_NAME=$(python3 -c 'from distribution.archive import ARCHIVE_NAME; print(ARCHIVE_NAME)')
+python3 -m distribution.archive reproducible "$OUTPUT"
+ARCHIVE="$OUTPUT/$ARCHIVE_NAME"
+cp -- release/components.json "$OUTPUT/COMPONENTS.json"
+cp -- release/members.txt "$OUTPUT/release-members.txt"
+(
+    cd "$OUTPUT"
+    sha256sum -- COMPONENTS.json "$ARCHIVE_NAME" release-members.txt >SHA256SUMS
+)
+python3 -m distribution.archive inspect "$ARCHIVE"
+CHECKSUM=$(python3 -m distribution.archive digest "$ARCHIVE")
+printf 'release assets verified: %s\n' "$CHECKSUM"

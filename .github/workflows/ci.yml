@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    name: Arch Linux quality gates
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel-20260712.0.555161@sha256:212b1e518e94ee9c52be55e8a32da75fcf11e7b5610b80b49479e67880102406
+    steps:
+      - name: Bootstrap pinned Arch validation environment
+        run: |
+          printf 'Server = https://archive.archlinux.org/repos/2026/07/12/$repo/os/$arch\n' \
+            >/etc/pacman.d/mirrorlist
+          pacman -Sy --noconfirm --needed fish git python python-pip
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install development tools
+        run: |
+          python -m venv /tmp/doubt-ci
+          /tmp/doubt-ci/bin/pip install --disable-pip-version-check -r requirements/dev.txt
+          /tmp/doubt-ci/bin/pip install --disable-pip-version-check \
+            --require-hashes -r requirements/build.txt
+          echo /tmp/doubt-ci/bin >> "$GITHUB_PATH"
+      - name: Unit tests
+        run: ./check unit
+      - name: Structural architecture tests
+        run: ./check structure
+      - name: Import smoke test
+        run: ./check imports
+      - name: Compile check
+        run: ./check compile
+      - name: Shell syntax check
+        run: ./check shell
+      - name: CLI help and rejection smoke tests
+        run: ./check smoke
+      - name: Stale terminology detection
+        run: ./check terms
+      - name: Repository naming policy
+        run: ./check naming
+      - name: Version consistency
+        run: ./check version
+      - name: Deterministic distribution artifacts
+        run: ./check distribution
+      - name: Ruff lint
+        run: ./check lint
+      - name: Ruff formatting policy
+        run: ./check format
+      - name: Strict static typing
+        run: ./check typing
+      - name: Statement and branch coverage
+        run: ./check coverage
+      - name: Git whitespace
+        run: ./check diff
+      - name: Generated-artifact detection
+        run: ./check artifacts

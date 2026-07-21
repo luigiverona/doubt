@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+program=${0##*/}
+if [[ "$program" == tool ]]; then
+    tool=${1:?}
+    shift
+else
+    tool=$program
+fi
+state=${DOUBT_ACCEPTANCE_STATE:?}
+[[ -d "$state" && -f "$state/pacman" && -f "$state/aur" && -f "$state/flatpak" \
+    && -f "$state/mutations" ]] || {
+    printf 'acceptance provider state is not initialized\n' >&2
+    exit 2
+}
+
+add_unique() {
+    local file=$1 value=$2
+    grep -Fx "$value" "$file" >/dev/null 2>&1 || printf '%s\n' "$value" >>"$file"
+}
+
+has() {
+    grep -Fx "$2" "$1" >/dev/null 2>&1
+}
+
+metadata() {
+    local name=$1
+    printf 'Name                          : %s\n' "$name"
+    printf 'Version                       : 1.0-1\n'
+    printf 'Provides                      : None\n'
+    printf 'Depends On                    : None\n'
+    printf 'Conflicts With                : None\n'
+    printf 'Replaces                      : None\n\n'
+}
+
+case "$tool" in
+    pacman)
+        operation=${1:-}
+        case "$operation" in
+            -Qi)
+                if [[ $# -eq 1 ]]; then
+                    while IFS= read -r package; do [[ -n "$package" ]] && metadata "$package"; done <"$state/pacman"
+                else
+                    package=${!#}
+                    has "$state/pacman" "$package"
+                fi
+                ;;
+            -Qq) sort -u "$state/pacman" ;;
+            -Qqm)
+                if [[ -s "$state/aur" ]]; then sort -u "$state/aur"; else exit 1; fi
+                ;;
+            -Si)
+                seen=false
+                for value in "$@"; do
+                    if $seen; then metadata "$value"; fi
+                    [[ "$value" == -- ]] && seen=true
+                done
+                :
+                ;;
+            -Sp)
+                seen=false
+                for value in "$@"; do
+                    if $seen; then printf '%s\n' "$value"; fi
+                    [[ "$value" == -- ]] && seen=true
+                done
+                :
+                ;;
+            -Qo)
+                printf '/usr/bin/codex is owned by openai-codex 1.0-1\n'
+                ;;
+            -S)
+                seen=false
+                for value in "$@"; do
+                    if $seen; then add_unique "$state/pacman" "$value"; printf 'pacman %s\n' "$value" >>"$state/mutations"; fi
+                    [[ "$value" == -- ]] && seen=true
+                done
+                :
+                ;;
+            *) printf 'acceptance pacman: unexpected command: %s\n' "$*" >&2; exit 2 ;;
+        esac
+        ;;
+    yay)
+        if [[ ${1:-} == -Q ]]; then
+            if [[ $# -eq 1 ]]; then sort -u "$state/aur"; else has "$state/aur" "$2"; fi
+        elif [[ " $* " == *" -S "* ]]; then
+            seen=false
+            for value in "$@"; do
+                if $seen; then
+                    add_unique "$state/pacman" "$value"
+                    add_unique "$state/aur" "$value"
+                    printf 'aur %s\n' "$value" >>"$state/mutations"
+                fi
+                [[ "$value" == -- ]] && seen=true
+            done
+            :
+        else
+            printf 'acceptance yay: unexpected command: %s\n' "$*" >&2
+            exit 2
+        fi
+        ;;
+    flatpak)
+        case ${1:-} in
+            remotes) [[ -f "$state/flathub" ]] && printf 'flathub\n' ;;
+            remote-add) touch "$state/flathub"; printf 'flatpak remote\n' >>"$state/mutations" ;;
+            info) has "$state/flatpak" "${2:-}" ;;
+            install)
+                [[ " ${*} " == *" --assumeyes "* ]] || {
+                    printf 'hidden Flatpak confirmation would be required\n' >&2
+                    exit 2
+                }
+                printf 'Looking for matches?\n'
+                printf 'acceptance.Application permissions:\n'
+                printf 'ID Branch Op Remote Download\n'
+                shift 3
+                for value in "$@"; do
+                    add_unique "$state/flatpak" "$value"
+                    printf 'flatpak %s\n' "$value" >>"$state/mutations"
+                done
+                printf 'Installation complete.\n'
+                ;;
+            *) printf 'acceptance flatpak: unexpected command: %s\n' "$*" >&2; exit 2 ;;
+        esac
+        ;;
+    sudo)
+        printf 'sudo\n' >>"$state/mutations"
+        exec "$@"
+        ;;
+    curl)
+        for value in "$@"; do
+            if [[ "$value" == https://aur.archlinux.org/rpc/v5/info?arg[]=* ]]; then
+                package=${value##*=}
+                printf '{"type":"multiinfo","results":[{"Name":"%s","Version":"1.0-1","Depends":[],"MakeDepends":[],"CheckDepends":[],"Provides":[],"Conflicts":[],"Replaces":[]}]}\n' "$package"
+                exit 0
+            fi
+        done
+        exec /usr/bin/curl "$@"
+        ;;
+    git)
+        if [[ ${1:-} == config && ${2:-} == --global && ${3:-} == --get ]]; then
+            key=${4:-}
+            [[ -f "$state/git-$key" ]] || exit 1
+            cat "$state/git-$key"
+        elif [[ ${1:-} == config && ${2:-} == --global ]]; then
+            printf '%s\n' "${4:-}" >"$state/git-${3:-}"
+            printf 'git %s\n' "${3:-}" >>"$state/mutations"
+        else
+            printf 'acceptance git: unexpected command: %s\n' "$*" >&2
+            exit 2
+        fi
+        ;;
+    gh)
+        case "${1:-} ${2:-}" in
+            "auth status") [[ -f "$state/gh-auth" ]] ;;
+            "auth login") touch "$state/gh-auth"; printf 'github auth\n' >>"$state/mutations" ;;
+            "auth refresh") exit 0 ;;
+            "config get") [[ -f "$state/gh-protocol" ]] && cat "$state/gh-protocol" || exit 1 ;;
+            "config set") printf 'ssh\n' >"$state/gh-protocol"; printf 'github protocol\n' >>"$state/mutations" ;;
+            "api user") printf '{"login":"acceptance-user"}\n' ;;
+            "api --paginate")
+                if [[ -f "$state/gh-key" ]]; then
+                    key=$(cat "$state/gh-key")
+                    printf '[[{"id":1,"key":"%s","title":"doubt"}]]\n' "$key"
+                else
+                    printf '[[]]\n'
+                fi
+                ;;
+            "api --method")
+                if [[ " $* " == *" POST "* ]]; then
+                    key=''
+                    for value in "$@"; do [[ "$value" == key=* ]] && key=${value#key=}; done
+                    printf '%s\n' "$key" >"$state/gh-key"
+                    printf '{"id":1,"key":"%s","title":"doubt"}\n' "$key"
+                else
+                    exit 0
+                fi
+                ;;
+            *) printf 'acceptance gh: unexpected command: %s\n' "$*" >&2; exit 2 ;;
+        esac
+        ;;
+    ssh-keygen)
+        if [[ ${1:-} == -y ]]; then
+            printf 'ssh-ed25519 AAAAACCEPTANCEKEY\n'
+        else
+            output=''
+            previous=''
+            for value in "$@"; do
+                [[ "$previous" == -f ]] && output=$value
+                previous=$value
+            done
+            [[ -n "$output" ]] || exit 2
+            printf 'acceptance-private-key\n' >"$output"
+            printf 'ssh-ed25519 AAAAACCEPTANCEKEY doubt-managed\n' >"$output.pub"
+        fi
+        ;;
+    ssh)
+        if [[ ${1:-} == -G ]]; then
+            printf 'user git\nhostname github.com\nidentityfile ~/.ssh/doubt\nidentitiesonly yes\n'
+        else
+            printf "Hi acceptance-user! You've successfully authenticated, but GitHub does not provide shell access.\n" >&2
+            exit 1
+        fi
+        ;;
+    codex)
+        codex_home=${CODEX_HOME:?}
+        if [[ ${1:-} == login && ${2:-} == status ]]; then
+            [[ -f "$codex_home/auth.json" ]]
+        elif [[ ${1:-} == login ]]; then
+            mkdir -p -- "$codex_home"
+            printf '{}\n' >"$codex_home/auth.json"
+            chmod 0600 "$codex_home/auth.json"
+            printf 'codex auth\n' >>"$state/mutations"
+        else
+            exit 0
+        fi
+        ;;
+    vercmp) printf '0\n' ;;
+    *) printf 'unknown acceptance fixture: %s\n' "$tool" >&2; exit 2 ;;
+esac

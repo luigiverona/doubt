@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+IMAGE=doubt-acceptance:local
+BOOTSTRAP=archlinux-bootstrap-2026.07.01-x86_64.tar.zst
+BOOTSTRAP_URL="https://geo.mirror.pkgbuild.com/iso/2026.07.01/$BOOTSTRAP"
+BOOTSTRAP_SHA256=9cadf82e389427fb61739ad3b0c213b2abd331354fab6460972e4e52bb8ff9e8
+
+if command -v podman >/dev/null 2>&1; then
+    podman build --pull=never --file "$ROOT/acceptance/Containerfile" --tag "$IMAGE" "$ROOT"
+    podman run --rm --network=slirp4netns "$IMAGE"
+    exit
+fi
+
+if command -v docker >/dev/null 2>&1; then
+    docker build --pull=false --file "$ROOT/acceptance/Containerfile" --tag "$IMAGE" "$ROOT"
+    docker run --rm --network=bridge "$IMAGE"
+    exit
+fi
+
+for command in awk bwrap bsdtar curl id sed sha256sum unshare; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        printf 'container acceptance fallback requires %s\n' "$command" >&2
+        exit 2
+    fi
+done
+
+ACCOUNT=$(id -un)
+UID_NOW=$(id -u)
+GID_NOW=$(id -g)
+UID_START=$(awk -F: -v account="$ACCOUNT" '$1 == account {print $2; exit}' /etc/subuid)
+UID_COUNT=$(awk -F: -v account="$ACCOUNT" '$1 == account {print $3; exit}' /etc/subuid)
+GID_START=$(awk -F: -v account="$ACCOUNT" '$1 == account {print $2; exit}' /etc/subgid)
+GID_COUNT=$(awk -F: -v account="$ACCOUNT" '$1 == account {print $3; exit}' /etc/subgid)
+if [ -z "$UID_START" ] || [ -z "$UID_COUNT" ] || \
+    [ -z "$GID_START" ] || [ -z "$GID_COUNT" ]; then
+    printf 'container acceptance fallback requires delegated subordinate IDs\n' >&2
+    exit 2
+fi
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/doubt-arch.XXXXXX")
+cleanup() {
+    unshare \
+        --map-users "0:$UID_NOW:1" --map-users "1:$UID_START:$UID_COUNT" \
+        --map-groups "0:$GID_NOW:1" --map-groups "1:$GID_START:$GID_COUNT" \
+        /bin/bash -c 'chmod -R u+rwX "$1"; rm -rf "$1"' bash "$WORK" \
+        2>/dev/null || {
+            chmod -R u+rwX "$WORK" 2>/dev/null || true
+            rm -rf "$WORK"
+        }
+}
+trap cleanup EXIT HUP INT TERM
+curl --continue-at - --fail --location --retry 4 --retry-all-errors --retry-delay 2 \
+    --silent --show-error "$BOOTSTRAP_URL" --output "$WORK/$BOOTSTRAP"
+printf '%s  %s\n' "$BOOTSTRAP_SHA256" "$WORK/$BOOTSTRAP" | sha256sum --check --status
+mkdir "$WORK/root"
+bsdtar --extract --file "$WORK/$BOOTSTRAP" --directory "$WORK/root" \
+    --strip-components 1 --exclude 'dev/*'
+chmod -R u+rwX "$WORK/root"
+sed -i 's/^DownloadUser.*/DownloadUser = root/' "$WORK/root/etc/pacman.conf"
+printf 'Server = https://archive.archlinux.org/repos/2026/07/12/$repo/os/$arch\n' \
+    >"$WORK/root/etc/pacman.d/mirrorlist"
+mkdir -p "$WORK/root/workspace"
+
+unshare \
+    --map-users "0:$UID_NOW:1" --map-users "1:$UID_START:$UID_COUNT" \
+    --map-groups "0:$GID_NOW:1" --map-groups "1:$GID_START:$GID_COUNT" \
+    bwrap \
+    --unshare-pid --unshare-uts --unshare-ipc --unshare-cgroup-try \
+    --bind "$WORK/root" / \
+    --dev /dev --proc /proc --tmpfs /tmp --tmpfs /run \
+    --ro-bind "$ROOT" /workspace \
+    --ro-bind /etc/resolv.conf /etc/resolv.conf \
+    --chdir /workspace \
+    /bin/bash -lc '
+        touch /run/doubt-disposable-acceptance
+        pacman-key --init
+        pacman-key --populate archlinux
+        pacman -Sy --noconfirm --needed git python python-pip curl sudo
+        python -m venv /tmp/doubt-acceptance-tools
+        /tmp/doubt-acceptance-tools/bin/pip install --disable-pip-version-check \
+            --require-hashes -r requirements/build.txt
+        export PATH=/tmp/doubt-acceptance-tools/bin:$PATH
+        ./acceptance/container/check
+    '

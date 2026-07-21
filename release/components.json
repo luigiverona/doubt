@@ -1,0 +1,26 @@
+{
+  "architecture": "x86_64",
+  "components": [
+    {"name": "doubt", "version": "1.0.5", "license": "MIT"},
+    {"name": "CPython", "version": "3.14.6", "license": "PSF-2.0"},
+    {"name": "PyInstaller bootloader", "version": "6.21.0", "license": "GPL-2.0-or-later WITH Bootloader-exception"},
+    {"name": "OpenSSL", "version": "3.6.3", "license": "Apache-2.0"},
+    {"name": "zlib", "version": "1.3.2", "license": "Zlib"},
+    {"name": "XZ Utils", "version": "5.8.3", "license": "0BSD AND LGPL-2.1-or-later AND GPL-2.0-or-later"},
+    {"name": "Zstandard", "version": "1.5.7", "license": "BSD-3-Clause OR GPL-2.0-only"},
+    {"name": "bzip2", "version": "1.0.8", "license": "bzip2-1.0.6"},
+    {"name": "Brotli", "version": "1.2.0", "license": "MIT"},
+    {"name": "mpdecimal", "version": "4.0.1", "license": "BSD-2-Clause"}
+  ],
+  "glibc": {
+    "bundled": false,
+    "minimum_build_snapshot": "2026-07-12",
+    "note": "The executable dynamically uses the target Arch system glibc."
+  },
+  "packaging": {
+    "format": "PyInstaller one-directory",
+    "runtime_extraction": false,
+    "python_required_on_host": false
+  },
+  "schema": 1
+}

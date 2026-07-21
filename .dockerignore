@@ -1,0 +1,11 @@
+__pycache__
+.git
+*.py[cod]
+.hypothesis
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.json
+coverage.xml
+htmlcov

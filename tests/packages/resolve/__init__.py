@@ -1,0 +1,1 @@
+"""Package-conflict tests."""

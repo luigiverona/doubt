@@ -1,0 +1,41 @@
+name: Acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "43 5 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  container:
+    name: Disposable Arch container acceptance
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel-20260712.0.555161@sha256:212b1e518e94ee9c52be55e8a32da75fcf11e7b5610b80b49479e67880102406
+    steps:
+      - name: Bootstrap pinned acceptance build environment
+        run: |
+          printf 'Server = https://archive.archlinux.org/repos/2026/07/12/$repo/os/$arch\n' \
+            >/etc/pacman.d/mirrorlist
+          pacman -Sy --noconfirm --needed git python python-pip curl sudo
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run clean-room acceptance
+        run: |
+          python -m venv /tmp/doubt-acceptance-tools
+          /tmp/doubt-acceptance-tools/bin/pip install --disable-pip-version-check \
+            --require-hashes -r requirements/build.txt
+          export PATH=/tmp/doubt-acceptance-tools/bin:$PATH
+          ./acceptance/container/check

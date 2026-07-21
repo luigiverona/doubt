@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+if [[ -z "${BASH_VERSION:-}" ]]; then
+    printf 'doubt install: Bash is required\n' >&2
+    exit 1
+fi
+if [[ -o posix ]]; then
+    printf 'doubt install: Bash POSIX mode is unsupported\n' >&2
+    exit 1
+fi
+set -euo pipefail
+
+umask 077
+export LC_ALL=C
+
+readonly VERSION='1.0.5'
+readonly ARCHIVE_NAME='doubt-1.0.5-x86_64.tar.gz'
+readonly ARCHIVE_ROOT='doubt-1.0.5-x86_64'
+readonly PUBLIC_ARCHIVE_URL='https://github.com/luigiverona/doubt/releases/download/1.0.5/doubt-1.0.5-x86_64.tar.gz'
+readonly ARCHIVE_SHA256='a75645377468c6fb01930f7294b88af3d6d3c0e7146f3c99f8c51d38a679d7ce' # pragma: allowlist secret
+readonly PUBLIC_MANIFEST_URL='https://github.com/luigiverona/doubt/releases/download/1.0.5/release-members.txt'
+readonly MANIFEST_SHA256='e8a49f0da64962bc4173535f85db82fdf7c31c52205349d086505f86f05e92b8' # pragma: allowlist secret
+
+WORK=''
+WORK_PARENT=''
+
+fail() {
+    printf 'doubt install: %s\n' "$1" >&2
+    exit 1
+}
+
+ARCHIVE_URL=$PUBLIC_ARCHIVE_URL
+MANIFEST_URL=$PUBLIC_MANIFEST_URL
+DOWNLOAD_PROTOCOL='=https'
+if [[ -n "${DOUBT_ACCEPTANCE_BASE_URL:-}" ]]; then
+    sentinel=/run/doubt-disposable-acceptance
+    [[ -f "$sentinel" && ! -L "$sentinel" ]] || fail 'controlled acceptance marker is unavailable'
+    [[ $(stat -c '%u:%a' -- "$sentinel") == '0:600' ]] || fail 'controlled acceptance marker is unsafe'
+    [[ "$DOUBT_ACCEPTANCE_BASE_URL" =~ ^http://127\.0\.0\.1:[1-9][0-9]{0,4}$ ]] || \
+        fail 'controlled acceptance URL is invalid'
+    ARCHIVE_URL="$DOUBT_ACCEPTANCE_BASE_URL/$ARCHIVE_NAME"
+    MANIFEST_URL="$DOUBT_ACCEPTANCE_BASE_URL/release-members.txt"
+    DOWNLOAD_PROTOCOL='=http'
+fi
+readonly ARCHIVE_URL MANIFEST_URL DOWNLOAD_PROTOCOL
+
+cleanup() {
+    [[ -n "${WORK:-}" && -n "${WORK_PARENT:-}" ]] || return 0
+    case "$WORK" in
+        "$WORK_PARENT"/doubt.*) ;;
+        *) printf 'doubt install: refusing unsafe temporary cleanup\n' >&2; return 0 ;;
+    esac
+    [[ -d "$WORK" && ! -L "$WORK" ]] || return 0
+    [[ $(stat -c '%u' -- "$WORK" 2>/dev/null || printf invalid) == "$EUID" ]] || {
+        printf 'doubt install: temporary directory ownership changed; not removing it\n' >&2
+        return 0
+    }
+    chmod -R u+rwX -- "$WORK" 2>/dev/null || return 0
+    rm -rf -- "$WORK"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "required Arch base command is missing: $1"
+}
+
+download() {
+    local url=$1 output=$2
+    curl --fail --silent --show-error --location \
+        --proto "$DOWNLOAD_PROTOCOL" --proto-redir "$DOWNLOAD_PROTOCOL" --tlsv1.2 \
+        --retry 4 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 15 --max-time 300 --max-filesize 67108864 \
+        --output "$output" "$url"
+}
+
+verify_digest() {
+    local path=$1 expected=$2 label=$3 actual
+    actual=$(sha256sum -- "$path")
+    actual=${actual%% *}
+    [[ "$actual" == "$expected" ]] || \
+        fail "$label SHA-256 mismatch; expected $expected, received $actual"
+}
+
+files_match() {
+    local left=$1 right=$2 left_digest right_digest
+    left_digest=$(sha256sum -- "$left")
+    right_digest=$(sha256sum -- "$right")
+    [[ "${left_digest%% *}" == "${right_digest%% *}" ]]
+}
+
+[[ $EUID -ne 0 ]] || fail 'refusing to run as root'
+[[ -n "${HOME:-}" && "$HOME" == /* ]] || fail 'HOME must be an absolute path'
+[[ -d "$HOME" && ! -L "$HOME" && -O "$HOME" && -r "$HOME" && -w "$HOME" && -x "$HOME" ]] || \
+    fail 'HOME must be a safe user-owned directory'
+[[ $(uname -s) == Linux && $(uname -m) == x86_64 && -f /etc/arch-release ]] || \
+    fail 'doubt supports Arch Linux and Arch-based x86_64 systems only'
+
+for command in awk bash bsdtar chmod curl cut find mktemp rm sed sha256sum sort stat uname wc; do
+    require_command "$command"
+done
+
+if ! exec 3<>/dev/tty || [[ ! -t 3 ]]; then
+    exec 3>&- 2>/dev/null || true
+    fail 'an interactive controlling terminal is required before any changes can be made'
+fi
+
+home_mode=$(stat -c '%a' -- "$HOME")
+(( (8#$home_mode & 8#022) == 0 )) || fail 'HOME must not be group- or world-writable'
+
+WORK_PARENT=${TMPDIR:-/tmp}
+WORK_PARENT=${WORK_PARENT%/}
+[[ -n "$WORK_PARENT" && "$WORK_PARENT" == /* && -d "$WORK_PARENT" && ! -L "$WORK_PARENT" ]] || \
+    fail 'TMPDIR must identify a real absolute directory'
+WORK=$(mktemp -d "$WORK_PARENT/doubt.XXXXXXXX")
+[[ -d "$WORK" && ! -L "$WORK" && -O "$WORK" ]] || fail 'could not create a private temporary directory'
+chmod 0700 -- "$WORK"
+[[ $(stat -c '%a' -- "$WORK") == 700 ]] || fail 'temporary directory permissions are unsafe'
+
+readonly ARCHIVE="$WORK/$ARCHIVE_NAME"
+readonly MANIFEST="$WORK/release-members.txt"
+readonly EXPECTED_NAMES="$WORK/expected-names"
+readonly ACTUAL_NAMES="$WORK/actual-names"
+readonly EXTRACTED="$WORK/extracted"
+readonly STAGE="$EXTRACTED/$ARCHIVE_ROOT"
+readonly RUNTIME_WORK="$WORK/runtime"
+
+printf 'Doubt installer\n\n'
+printf 'Downloading release...\n'
+download "$ARCHIVE_URL" "$ARCHIVE"
+printf 'Downloading manifest...\n'
+download "$MANIFEST_URL" "$MANIFEST"
+printf 'Verifying release...\n'
+verify_digest "$ARCHIVE" "$ARCHIVE_SHA256" 'release archive'
+verify_digest "$MANIFEST" "$MANIFEST_SHA256" 'release manifest'
+
+[[ $(awk 'NF != 2 || ($1 != "d" && $1 != "f") { bad=1 } END { print bad+0 }' "$MANIFEST") == 0 ]] || \
+    fail 'release manifest syntax is invalid'
+cut -d ' ' -f 2- "$MANIFEST" >"$EXPECTED_NAMES"
+[[ $(sort -u "$EXPECTED_NAMES" | wc -l) == $(wc -l <"$EXPECTED_NAMES") ]] || \
+    fail 'release manifest contains duplicate members'
+while IFS= read -r name; do
+    [[ -n "$name" && "$name" != /* && "$name" != *'//'*
+        && "$name" != '.' && "$name" != '..'
+        && "$name" != './'* && "$name" != *'/../'* && "$name" != *'/./'* ]] || \
+        fail "unsafe release member: $name"
+    [[ "$name" == "$ARCHIVE_ROOT" || "$name" == "$ARCHIVE_ROOT/"* ]] || \
+        fail "release member escapes its root: $name"
+done <"$EXPECTED_NAMES"
+
+bsdtar -tf "$ARCHIVE" | sed 's:/$::' >"$ACTUAL_NAMES"
+files_match "$EXPECTED_NAMES" "$ACTUAL_NAMES" || fail 'release archive members differ from the trusted manifest'
+while IFS= read -r listing; do
+    case "${listing:0:1}" in
+        d|-) ;;
+        *) fail 'release archive contains a link or unsupported file type' ;;
+    esac
+done < <(bsdtar -tvf "$ARCHIVE")
+
+printf 'Extracting release...\n'
+mkdir -m 0700 -- "$EXTRACTED" "$RUNTIME_WORK"
+bsdtar -xpf "$ARCHIVE" -C "$EXTRACTED" --no-same-owner
+[[ -d "$STAGE" && ! -L "$STAGE" && -x "$STAGE/doubt" && ! -L "$STAGE/doubt" ]] || \
+    fail 'staged release is incomplete or unsafe'
+
+: >"$ACTUAL_NAMES"
+while IFS= read -r -d '' path; do
+    relative=${path#"$EXTRACTED"/}
+    if [[ -d "$path" && ! -L "$path" ]]; then
+        kind=d
+    elif [[ -f "$path" && ! -L "$path" ]]; then
+        kind=f
+    else
+        fail "staged release contains an unsupported member: $relative"
+    fi
+    printf '%s %s\n' "$kind" "$relative" >>"$ACTUAL_NAMES"
+done < <(find "$STAGE" -depth -print0)
+sort -k2 "$ACTUAL_NAMES" >"$WORK/actual-manifest"
+sort -k2 "$MANIFEST" >"$WORK/expected-manifest"
+files_match "$WORK/expected-manifest" "$WORK/actual-manifest" || \
+    fail 'staged release differs from the trusted manifest'
+
+printf 'version=%s\nsha256=%s\n' "$VERSION" "$ARCHIVE_SHA256" >"$STAGE/.doubt-release"
+chmod 0644 -- "$STAGE/.doubt-release"
+
+printf 'Starting Doubt...\n\n'
+DOUBT_BOOTSTRAP_STAGE="$STAGE" \
+DOUBT_BOOTSTRAP_SHA256="$ARCHIVE_SHA256" \
+DOUBT_WORK_ROOT="$RUNTIME_WORK" \
+DOUBT_CONFIRM_FD=0 \
+    "$STAGE/doubt" "$@" <&3

@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT"
+
+PYTHON=${PYTHON:-python3}
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/doubt-check.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT HUP INT TERM
+
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPYCACHEPREFIX="$WORK/pycache"
+export MYPY_CACHE_DIR="$WORK/mypy"
+export RUFF_CACHE_DIR="$WORK/ruff"
+export COVERAGE_FILE="$WORK/coverage"
+
+heading() {
+    printf '\n== %s ==\n' "$1"
+}
+
+require() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        printf 'required development command is unavailable: %s\n' "$1" >&2
+        printf 'install requirements/dev.txt in a disposable virtual environment\n' >&2
+        exit 1
+    fi
+}
+
+gate=${1:-all}
+case "$gate" in
+    unit)
+        heading "unit tests"
+        "$PYTHON" -m unittest discover
+        ;;
+    structure)
+        heading "structural architecture tests"
+        "$PYTHON" -m unittest tests.structure.test
+        ;;
+    compile)
+        heading "compile check"
+        "$PYTHON" -m compileall -q acceptance distribution doubt quality tests
+        ;;
+    imports)
+        heading "import smoke test"
+        "$PYTHON" -m quality.imports
+        ;;
+    shell)
+        heading "shell syntax"
+        mapfile -t scripts < <(git -c safe.directory="$ROOT" ls-files --stage | awk '$1 == "100755" {print $4}')
+        ((${#scripts[@]} > 0))
+        checked=()
+        for script in "${scripts[@]}"; do
+            [[ -f "$script" ]] || continue
+            IFS= read -r interpreter <"$script"
+            [[ "$interpreter" == '#!/usr/bin/env bash' ]] || {
+                printf 'tracked executable has unexpected interpreter: %s\n' "$script" >&2
+                exit 1
+            }
+            checked+=("$script")
+        done
+        ((${#checked[@]} > 0))
+        bash -n "${checked[@]}"
+        ;;
+    smoke)
+        heading "safe CLI smoke tests"
+        "$PYTHON" -m quality.smoke
+        ;;
+    terms)
+        heading "terminology"
+        "$PYTHON" -m quality.terms
+        ;;
+    naming)
+        heading "naming policy"
+        "$PYTHON" -m quality.naming
+        ;;
+    artifacts)
+        heading "generated artifacts"
+        "$PYTHON" -m quality.artifacts
+        ;;
+    version)
+        heading "version consistency"
+        "$PYTHON" -m quality.version
+        ;;
+    actions)
+        heading "GitHub Actions pinning"
+        "$PYTHON" -m quality.actions
+        ;;
+    distribution)
+        heading "deterministic distribution artifacts"
+        "$PYTHON" -m quality.distribution
+        ;;
+    secrets)
+        heading "secret scanning"
+        require detect-secrets-hook
+        "$PYTHON" -m quality.secrets
+        git -c safe.directory="$ROOT" ls-files -z > "$WORK/tracked"
+        xargs -0 detect-secrets-hook --exclude-lines 'PRIVATE_KEY_(NAME|MODE)' < "$WORK/tracked"
+        ;;
+    danger)
+        heading "dangerous execution patterns"
+        "$PYTHON" -m quality.danger
+        ;;
+    lint)
+        heading "Ruff lint"
+        require ruff
+        ruff check acceptance distribution doubt quality tests
+        ;;
+    format)
+        heading "Ruff formatting policy"
+        require ruff
+        ruff check --select E4,E7,E9,I acceptance distribution doubt quality tests
+        ;;
+    typing)
+        heading "strict static typing"
+        require mypy
+        mypy acceptance distribution doubt quality
+        ;;
+    coverage)
+        heading "statement and branch coverage"
+        require coverage
+        coverage erase
+        coverage run -m unittest discover
+        coverage report
+        coverage json -o "$WORK/coverage.json"
+        "$PYTHON" -m quality.coverage "$WORK/coverage.json"
+        ;;
+    fault)
+        heading "fault and retry matrix"
+        "$PYTHON" -m unittest \
+            tests.system.lock.test \
+            tests.system.files.test \
+            tests.sources.test \
+            tests.packages.resolve.test \
+            tests.tasks.github.test \
+            tests.tasks.codex.test
+        ;;
+    advisory)
+        heading "development dependency advisories"
+        require pip-audit
+        pip-audit --progress-spinner=off -r requirements/dev.txt
+        ;;
+    diff)
+        heading "Git whitespace"
+        git -c safe.directory="$ROOT" diff --check
+        ;;
+    security)
+        "$0" secrets
+        "$0" danger
+        "$0" actions
+        "$0" advisory
+        ;;
+    all)
+        for name in unit structure fault lint format typing coverage compile imports shell smoke terms naming secrets danger actions version advisory distribution diff artifacts; do
+            "$0" "$name"
+        done
+        ;;
+    *)
+        printf 'unknown quality gate: %s\n' "$gate" >&2
+        exit 2
+        ;;
+esac

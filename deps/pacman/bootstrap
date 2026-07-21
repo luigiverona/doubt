@@ -1,0 +1,4 @@
+# bootstrap dependencies required by doubt
+git
+base-devel
+flatpak

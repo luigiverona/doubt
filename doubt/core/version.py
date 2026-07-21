@@ -1,0 +1,3 @@
+"""Canonical runtime version."""
+
+VERSION = "1.0.5"

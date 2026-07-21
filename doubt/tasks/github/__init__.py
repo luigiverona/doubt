@@ -1,0 +1,1 @@
+"""GitHub workstation capability."""
